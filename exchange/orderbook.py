@@ -1,88 +1,81 @@
-from __future__ import annotations
-
 import bisect
 import heapq
 import itertools
 from collections import deque
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Literal
 
 from .models import Order, OrderResult, OrderStatus, Trade
 
 class _SideBook:
-    __slots__ = ("price_map", "sorted_prices", "is_bid", "_level_volume")
 
-    def __init__(self, is_bid: bool) -> None:
-        self.price_map: Dict[float, deque[Order]] = {}
-        self.sorted_prices: List[float] = []
+    def __init__(self, is_bid):
+        self.priceMap = {}
+        self.sorted_prices = []
         self.is_bid = is_bid
-        self._level_volume: Dict[float, int] = {}
+        self.level_volume = {}
 
-    def _remove_price_level(self, price: float) -> None:
+    def _remove_price_level(self, price):
 
-        self.price_map.pop(price, None)
-        self._level_volume.pop(price, None)
+        self.priceMap.pop(price, None)
+        self.level_volume.pop(price, None)
         idx = bisect.bisect_left(self.sorted_prices, price)
         if idx < len(self.sorted_prices) and self.sorted_prices[idx] == price:
             del self.sorted_prices[idx]
 
-    def add_order(self, order: Order) -> None:
+    def add_order(self, order):
         price = order.price
-        if price not in self.price_map:
-            self.price_map[price] = deque()
+        if price not in self.priceMap:
+            self.priceMap[price] = deque()
             bisect.insort(self.sorted_prices, price)
-            self._level_volume[price] = 0
-        self.price_map[price].append(order)
-        self._level_volume[price] += order.remaining_quantity
+            self.level_volume[price] = 0
+        self.priceMap[price].append(order)
+        self.level_volume[price] += order.remaining_quantity
 
-    def remove_order(self, order: Order) -> None:
+    def remove_order(self, order):
         price = order.price
-        q = self.price_map.get(price)
+        q = self.priceMap.get(price)
         if q is None:
             return
         try:
             q.remove(order)
         except ValueError:
             return
-        self._level_volume[price] = self._level_volume.get(price, 0) - order.remaining_quantity
-        if self._level_volume.get(price, 0) <= 0:
+        self.level_volume[price] = self.level_volume.get(price, 0) - order.remaining_quantity
+        if self.level_volume.get(price, 0) <= 0:
             self._remove_price_level(price)
 
-    def cancel_order(self, order: Order) -> None:
+    def cancel_order(self, order):
         price = order.price
-        vol = self._level_volume.get(price)
+        vol = self.level_volume.get(price)
         if vol is None:
-            return  # level already cleaned up
-        self._level_volume[price] = vol - order.remaining_quantity
-        if self._level_volume[price] <= 0:
+            return 
+        self.level_volume[price] = vol - order.remaining_quantity
+        if self.level_volume[price] <= 0:
             self._remove_price_level(price)
 
-    def _update_fill(self, price: float, qty: int) -> None:
-        self._level_volume[price] = self._level_volume.get(price, 0) - qty
+    def _update_fill(self, price, qty):
+        self.level_volume[price] = self.level_volume.get(price, 0) - qty
 
-    def _clean_level(self, price: float) -> None:
-        if self._level_volume.get(price, 0) <= 0:
+    def _clean_level(self, price):
+        if self.level_volume.get(price, 0) <= 0:
             self._remove_price_level(price)
 
-    # ------------------------------------------------------------------ #
-    # Queries                                                              #
-    # ------------------------------------------------------------------ #
-
-    def best_price(self) -> Optional[float]:
+    def best_price(self):
         if not self.sorted_prices:
             return None
         return self.sorted_prices[-1] if self.is_bid else self.sorted_prices[0]
 
-    def best_queue(self) -> Optional[deque]:
+    def best_queue(self):
         bp = self.best_price()
         if bp is None:
             return None
-        return self.price_map.get(bp)
+        return self.priceMap.get(bp)
 
-    def volume_at_price(self, price: float) -> int:
-        return self._level_volume.get(price, 0)
+    def volume_at_price(self, price):
+        return self.level_volume.get(price, 0)
 
-    def depth(self, levels: int) -> List[Tuple[float, int]]:
-        result: List[Tuple[float, int]] = []
+    def depth(self, levels):
+        result = []
         if self.is_bid:
             prices = reversed(self.sorted_prices)
         else:
@@ -90,55 +83,53 @@ class _SideBook:
         for p in prices:
             if len(result) >= levels:
                 break
-            vol = self._level_volume.get(p, 0)
+            vol = self.level_volume.get(p, 0)
             if vol > 0:
                 result.append((p, vol))
         return result
 
-    def is_empty(self) -> bool:
+    def is_empty(self):
         return len(self.sorted_prices) == 0
 
 
 class _AssetBook:
-    __slots__ = ("bids", "asks")
 
-    def __init__(self) -> None:
+    def __init__(self):
         self.bids = _SideBook(is_bid=True)
         self.asks = _SideBook(is_bid=False)
 
 
 class OrderBook:
 
-    def __init__(self) -> None:
-        self._books: Dict[str, _AssetBook] = {}
-        self._orders_by_id: Dict[int, Order] = {}
-        self._order_history: deque[Order] = deque()
-        self._trades: List[Trade] = []
-        self._timestamp: int = 0
+    def __init__(self):
+        self._books = {}
+        self._ordersByID = {}
+        self._orderHistory = deque()
+        self._trades = []
+        self._timestamp = 0
 
-    def _get_book(self, asset: str) -> _AssetBook:
-        """Return (or lazily create) the book for *asset*.  O(1)."""
+    def _get_book(self, asset):
         book = self._books.get(asset)
         if book is None:
             book = _AssetBook()
             self._books[asset] = book
         return book
 
-    def _next_ts(self) -> int:
+    def _next_ts(self):
         self._timestamp += 1
         return self._timestamp
 
 
     def _match(
         self,
-        order: Order,
-        book: _AssetBook,
-    ) -> List[Trade]:
+        order,
+        book,
+    ):
 
         is_buy = order.side == "buy"
-        contra_side: _SideBook = book.asks if is_buy else book.bids
+        contra_side = book.asks if is_buy else book.bids
 
-        fills: List[Trade] = []
+        fills = []
 
         while order.remaining_quantity > 0 and not contra_side.is_empty():
             best_p = contra_side.best_price()
@@ -152,7 +143,7 @@ class OrderBook:
                 if order.price is not None and order.price > best_p:
                     break
 
-            queue = contra_side.price_map[best_p]
+            queue = contra_side.priceMap[best_p]
 
             while order.remaining_quantity > 0 and queue:
                 resting = queue[0]
@@ -204,12 +195,12 @@ class OrderBook:
 
     def _check_fok_feasibility(
         self,
-        order: Order,
-        book: _AssetBook,
-    ) -> bool:
+        order,
+        book,
+    ):
 
         is_buy = order.side == "buy"
-        contra_side: _SideBook = book.asks if is_buy else book.bids
+        contra_side = book.asks if is_buy else book.bids
 
         if contra_side.is_empty():
             return False
@@ -221,37 +212,37 @@ class OrderBook:
         else:
             price_iter = reversed(contra_side.sorted_prices)
 
-        for price in price_iter:
+        for i in price_iter:
             if needed <= 0:
                 break
             if is_buy:
-                if order.price is not None and order.price < price:
+                if order.price is not None and order.price < i:
                     break
             else:
-                if order.price is not None and order.price > price:
+                if order.price is not None and order.price > i:
                     break
 
-            queue = contra_side.price_map.get(price)
+            queue = contra_side.priceMap.get(i)
             if queue is None:
                 continue
-            for resting in queue:
-                if resting.status == "cancelled" or resting.remaining_quantity <= 0:
+            for i in queue:
+                if i.status == "cancelled" or i.remaining_quantity <= 0:
                     continue
-                needed -= resting.remaining_quantity
+                needed -= i.remaining_quantity
                 if needed <= 0:
                     break
 
         return needed <= 0
     def submit_order(
         self,
-        order_id: int,
-        order_owner: str,
+        order_id,
+        order_owner,
         order_type: Literal["market", "limit", "fok", "ioc"],
         side: Literal["buy", "sell"],
-        asset: str,
-        quantity: int,
-        price: Optional[float] = None,
-    ) -> OrderResult:
+        asset,
+        quantity,
+        price = None,
+    ):
 
         order = Order(
             order_id=order_id,
@@ -264,8 +255,8 @@ class OrderBook:
             timestamp=self._next_ts(),
         )
 
-        self._orders_by_id[order_id] = order
-        self._order_history.append(order)
+        self._ordersByID[order_id] = order
+        self._orderHistory.append(order)
 
         book = self._get_book(asset)
 
@@ -309,9 +300,9 @@ class OrderBook:
             remaining_quantity=order.remaining_quantity,
         )
 
-    def cancel_order(self, order_id: int) -> bool:
+    def cancel_order(self, order_id):
 
-        order = self._orders_by_id.get(order_id)
+        order = self._ordersByID.get(order_id)
         if order is None:
             return False
         if order.status in ("filled", "cancelled"):
@@ -328,12 +319,12 @@ class OrderBook:
 
     def modify_order(
         self,
-        order_id: int,
-        new_quantity: Optional[int] = None,
-        new_price: Optional[float] = None,
-    ) -> bool:
+        order_id,
+        new_quantity = None,
+        new_price = None,
+    ):
 
-        order = self._orders_by_id.get(order_id)
+        order = self._ordersByID.get(order_id)
         if order is None:
             return False
         if order.status in ("filled", "cancelled"):
@@ -374,14 +365,14 @@ class OrderBook:
                 delta = old_remaining - order.remaining_quantity
                 if delta != 0:
                     price = order.price
-                    own_side._level_volume[price] = (
-                        own_side._level_volume.get(price, 0) - delta
+                    own_side.level_volume[price] = (
+                        own_side.level_volume.get(price, 0) - delta
                     )
 
         return True
 
 
-    def get_best_bid(self, asset: str) -> Optional[Tuple[float, int]]:
+    def get_best_bid(self, asset):
         book = self._books.get(asset)
         if book is None:
             return None
@@ -393,7 +384,7 @@ class OrderBook:
             return None
         return (bp, vol)
 
-    def get_best_ask(self, asset: str) -> Optional[Tuple[float, int]]:
+    def get_best_ask(self, asset):
         book = self._books.get(asset)
         if book is None:
             return None
@@ -405,14 +396,14 @@ class OrderBook:
             return None
         return (bp, vol)
 
-    def get_spread(self, asset: str) -> Optional[float]:
+    def get_spread(self, asset):
         bid = self.get_best_bid(asset)
         ask = self.get_best_ask(asset)
         if bid is None or ask is None:
             return None
         return ask[0] - bid[0]
 
-    def get_market_depth(self, asset: str, levels: int = 5) -> dict:
+    def get_market_depth(self, asset, levels = 5):
         book = self._books.get(asset)
         if book is None:
             return {"bids": [], "asks": []}
@@ -422,8 +413,8 @@ class OrderBook:
         }
 
     def get_volume_at_price(
-        self, asset: str, price: float, side: Literal["bid", "ask"]
-    ) -> int:
+        self, asset, price, side: Literal["bid", "ask"]
+    ):
         book = self._books.get(asset)
         if book is None:
             return 0
@@ -431,13 +422,13 @@ class OrderBook:
         return s.volume_at_price(price)
 
 
-    def view_orderbook(self) -> Any:
-        snapshot: Dict[str, dict] = {}
+    def view_orderbook(self):
+        snapshot = {}
         for asset, book in self._books.items():
             bids_data = []
             for p in reversed(book.bids.sorted_prices):
                 orders = [
-                    o for o in book.bids.price_map[p]
+                    o for o in book.bids.priceMap[p]
                     if o.status in ("pending", "partial") and o.remaining_quantity > 0
                 ]
                 if orders:
@@ -445,7 +436,7 @@ class OrderBook:
             asks_data = []
             for p in book.asks.sorted_prices:
                 orders = [
-                    o for o in book.asks.price_map[p]
+                    o for o in book.asks.priceMap[p]
                     if o.status in ("pending", "partial") and o.remaining_quantity > 0
                 ]
                 if orders:
@@ -453,36 +444,36 @@ class OrderBook:
             snapshot[asset] = {"bids": bids_data, "asks": asks_data}
         return snapshot
 
-    def view_last_orders(self, n: int = 10000) -> List[Order]:
+    def view_last_orders(self, n = 10000):
 
-        return list(itertools.islice(reversed(self._order_history), n))
+        return list(itertools.islice(reversed(self._orderHistory), n))
 
-    def view_largest_orders(self, n: int = 10000) -> List[Order]:
+    def view_largest_orders(self, n = 10000):
         eligible = [
-            o for o in self._order_history if o.status != "cancelled"
+            x for x in self._orderHistory if x.status != "cancelled"
         ]
         return heapq.nlargest(n, eligible, key=lambda o: o.quantity)
 
-    def view_smallest_orders(self, n: int = 10000) -> List[Order]:
+    def view_smallest_orders(self, n = 10000):
         eligible = [
-            o for o in self._order_history if o.status != "cancelled"
+            x for x in self._orderHistory if x.status != "cancelled"
         ]
         return heapq.nsmallest(n, eligible, key=lambda o: o.quantity)
 
 
     def get_trade_history(
         self,
-        asset: Optional[str] = None,
-        limit: int = 1000,
-    ) -> List[Trade]:
+        asset = None,
+        limit = 1000,
+    ):
         if asset is None:
             return list(reversed(self._trades))[:limit]
         return [
-            t for t in reversed(self._trades) if t.asset == asset
+            x for x in reversed(self._trades) if x.asset == asset
         ][:limit]
 
-    def get_order_status(self, order_id: int) -> Optional[OrderStatus]:
-        order = self._orders_by_id.get(order_id)
+    def get_order_status(self, order_id):
+        order = self._ordersByID.get(order_id)
         if order is None:
             return None
         return OrderStatus(

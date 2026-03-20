@@ -53,13 +53,13 @@ def check_invariants(ob: OrderBook, label: str = "") -> None:
             tag = f"[{label}] {asset}.{side_name}" if label else f"{asset}.{side_name}"
 
             # sorted_prices, price_map, and _level_volume must have same keys
-            assert set(side.sorted_prices) == set(side.price_map.keys()), (
-                f"{tag}: sorted_prices keys mismatch price_map keys. "
-                f"sorted={side.sorted_prices}, map_keys={list(side.price_map.keys())}"
+            assert set(side.sorted_prices) == set(side.priceMap.keys()), (
+                f"{tag}: sorted_prices keys mismatch priceMap keys. "
+                f"sorted={side.sorted_prices}, map_keys={list(side.priceMap.keys())}"
             )
-            assert set(side.sorted_prices) == set(side._level_volume.keys()), (
-                f"{tag}: sorted_prices keys mismatch _level_volume keys. "
-                f"sorted={side.sorted_prices}, vol_keys={list(side._level_volume.keys())}"
+            assert set(side.sorted_prices) == set(side.level_volume.keys()), (
+                f"{tag}: sorted_prices keys mismatch level_volume keys. "
+                f"sorted={side.sorted_prices}, vol_keys={list(side.level_volume.keys())}"
             )
 
             # sorted_prices must actually be sorted ascending
@@ -72,13 +72,13 @@ def check_invariants(ob: OrderBook, label: str = "") -> None:
                 f"{tag}: duplicate prices in sorted_prices: {side.sorted_prices}"
             )
 
-            for p, q in side.price_map.items():
+            for p, q in side.priceMap.items():
                 assert len(q) > 0, f"{tag}: empty deque at price {p}"
 
-                # _level_volume must be positive for every active level
-                tracked_vol = side._level_volume.get(p, 0)
+                # level_volume must be positive for every active level
+                tracked_vol = side.level_volume.get(p, 0)
                 assert tracked_vol > 0, (
-                    f"{tag}: _level_volume[{p}] = {tracked_vol}, expected > 0"
+                    f"{tag}: level_volume[{p}] = {tracked_vol}, expected > 0"
                 )
 
                 # Deque may contain cancelled orders (lazy cancel).
@@ -103,14 +103,14 @@ def check_invariants(ob: OrderBook, label: str = "") -> None:
 
                 # Volume tracker must match sum of live order quantities
                 assert live_vol == tracked_vol, (
-                    f"{tag}: _level_volume[{p}] = {tracked_vol} but "
+                    f"{tag}: level_volume[{p}] = {tracked_vol} but "
                     f"sum of live remaining = {live_vol}"
                 )
 
     # Every order: filled + remaining == quantity
     # Exception: market/IOC orders that partially fill have their remainder
     # zeroed out (cancelled), so filled + remaining < quantity is expected.
-    for oid, order in ob._orders_by_id.items():
+    for oid, order in ob._ordersByID.items():
         if order.order_type in ("market", "ioc") and order.status in ("partial", "cancelled"):
             # Remainder was force-cancelled — skip this check
             assert order.filled_quantity <= order.quantity, (
@@ -745,7 +745,7 @@ def test_stress_interleaved_operations():
 def test_order_id_collision_ghost_in_book():
     """Submit same order_id twice — first order becomes a ghost in the book.
 
-    The second submit overwrites _orders_by_id, but the first order's
+    The second submit overwrites _ordersByID, but the first order's
     Order object is still sitting in the deque.  This creates a ghost:
     an order that will match but whose status updates go to an object
     no longer reachable via get_order_status().
@@ -760,7 +760,7 @@ def test_order_id_collision_ghost_in_book():
     r2 = ob.submit_order(SHARED_ID, "bob", "limit", "buy", "X", 50, 5.0)
     assert r2.status == "pending"
 
-    # _orders_by_id now points to the buy order
+    # _ordersByID now points to the buy order
     status = ob.get_order_status(SHARED_ID)
     assert status.status == "pending"
 
@@ -1152,7 +1152,7 @@ def test_trade_volume_conservation():
     # Verify orders: sum of filled quantities on buy side == sell side
     total_buy_filled = 0
     total_sell_filled = 0
-    for oid, order in ob._orders_by_id.items():
+    for oid, order in ob._ordersByID.items():
         if order.side == "buy":
             total_buy_filled += order.filled_quantity
         else:
