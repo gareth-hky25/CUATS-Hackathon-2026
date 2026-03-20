@@ -214,5 +214,5 @@ if __name__ == "__main__":
 
     end = time.time()
 
-    print("\n🔥 ALL EXTREME TESTS PASSED 🔥")
+    print("\nALL EXTREME TESTS PASSED")
     print(f"Total time: {end - start:.2f} seconds")
