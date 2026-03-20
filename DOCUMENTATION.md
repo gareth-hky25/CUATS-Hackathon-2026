@@ -42,7 +42,21 @@ is significant.
 
 ---
 
-### 2.3 Sorted price index — `list[float]` + `bisect`
+### 2.3 Per-level volume tracker — `dict[float, int]`
+
+Each side maintains a volume counter per active price level:
+
+```
+_level_volume : dict[float, int]
+```
+
+Updated in O(1) on every add, cancel, fill, and modify.  This eliminates the need to iterate
+the deque to compute volume, making `get_best_bid`, `get_best_ask`, `get_spread`,
+`get_market_depth`, and `get_volume_at_price` all **O(1)** or **O(levels)**.
+
+---
+
+### 2.4 Sorted price index — `list[float]` + `bisect`
 
 A plain sorted list of active price levels is maintained alongside `price_map`:
 
@@ -54,7 +68,8 @@ sorted_prices : list[float]   # ascending
   (lowest).  No heap-pop required; the best price is always at a known, stable index.
 - **Insertion of a new price level** — O(log P) search via `bisect.insort` + O(P) shift in
   the worst case, where P is the number of *distinct active price levels* on that side.
-- **Removal of an exhausted price level** — O(P) via `list.remove`.
+- **Removal of an exhausted price level** — O(log P) search via `bisect.bisect_left` + O(P)
+  shift.
 
 **Why not `heapq`?**  A min-heap gives O(1) peek and O(log P) insert, but has **no efficient
 arbitrary deletion**.  When a price level is exhausted or cancelled mid-book, a heap requires
@@ -72,7 +87,7 @@ best-price access, O(1) queue access, and implementation simplicity.
 
 ---
 
-### 2.4 Global order index — `dict[int, Order]`
+### 2.5 Global order index — `dict[int, Order]`
 
 ```
 _orders_by_id : dict[int, Order]
@@ -83,19 +98,20 @@ Maps every order ID to its `Order` object.  Provides **O(1)** lookup for `cancel
 
 ---
 
-### 2.5 Order history — `deque[Order]`
+### 2.6 Order history — `deque[Order]`
 
 ```
 _order_history : deque[Order]
 ```
 
-Orders are appended chronologically.  `view_last_orders(n)` reverses the deque and slices —
-O(n).  A `deque` is used rather than a `list` to leave open the option of capping history
-length with `maxlen` in the future without changing the interface.
+Orders are appended chronologically.  `view_last_orders(n)` uses `itertools.islice` on the
+reversed deque — truly **O(n)** for the requested *n*, not O(N) for the full history.  A
+`deque` is used rather than a `list` to leave open the option of capping history length with
+`maxlen` in the future without changing the interface.
 
 ---
 
-### 2.6 Trade tape — `list[Trade]`
+### 2.7 Trade tape — `list[Trade]`
 
 ```
 _trades : list[Trade]
@@ -112,22 +128,23 @@ index would reduce this to O(limit) at the cost of extra memory and bookkeeping.
 | Operation | Complexity | Notes |
 |---|---|---|
 | `submit_order` | **O(log P + K)** | `log P` for bisect insert; `K` fills each O(1) |
-| `cancel_order` | **O(Q + P)** amortised | O(1) dict lookup; O(Q) deque scan; O(P) price-list removal |
-| `modify_order` | **O(log P)** | Cancel (O(Q+P)) + re-insert (O(log P)) |
-| `get_best_bid` | **O(1)** + O(Q) | O(1) price; O(Q) volume sum at that level |
-| `get_best_ask` | **O(1)** + O(Q) | same as above |
-| `get_spread` | **O(Q)** | two best-price lookups |
-| `get_market_depth` | **O(levels × Q_avg)** | iterates price levels, sums volume |
-| `get_volume_at_price` | **O(Q)** | sum over deque at given price |
+| `cancel_order` | **O(1)** amortised | lazy mark + O(1) volume decrement; level cleanup O(log P + P) when volume hits 0 |
+| `modify_order` | **O(Q + log P)** | O(Q) eager deque removal + O(log P) bisect re-insert; qty-decrease-only is O(1) |
+| `get_best_bid` | **O(1)** | index into sorted\_prices + O(1) \_level\_volume lookup |
+| `get_best_ask` | **O(1)** | same as above |
+| `get_spread` | **O(1)** | two O(1) best-price lookups |
+| `get_market_depth` | **O(levels)** | iterates price levels, reads \_level\_volume dict |
+| `get_volume_at_price` | **O(1)** | dict lookup in \_level\_volume |
 | `view_orderbook` | **O(N_resting)** | full snapshot of all resting orders |
-| `view_last_orders` | **O(n)** | reverse + slice of history deque |
-| `view_largest_orders` | **O(N log N)** | filter + sort of all non-cancelled orders |
-| `view_smallest_orders` | **O(N log N)** | same |
+| `view_last_orders` | **O(n)** | `itertools.islice` on reversed deque — truly O(n), not O(N) |
+| `view_largest_orders` | **O(N log n)** | `heapq.nlargest` — O(N log n) when n ≪ N |
+| `view_smallest_orders` | **O(N log n)** | `heapq.nsmallest` — same |
 | `get_trade_history` | **O(T)** | reversed iteration, bounded by `limit` |
 | `get_order_status` | **O(F)** | O(1) lookup + O(F) fill list copy |
 
 *P = distinct active price levels on one side; Q = orders at one price level; K = fills during
-matching; N = total orders submitted; T = total trades; F = fills on one order.*
+matching; N = total orders submitted; n = requested count; T = total trades; F = fills on one
+order.*
 
 ---
 
@@ -146,21 +163,19 @@ eliminating the O(P) shift of a sorted list.  However:
 
 **Decision:** Keep `bisect` + `list`.
 
-### 4.2 Lazy vs. eager price-level cleanup
+### 4.2 Hybrid lazy-order / eager-level cancellation
 
-Cancelled orders could be left in their deque and skipped during matching ("lazy deletion"),
-avoiding the O(P) `sorted_prices.remove` on cancel.  The matching loop already skips
-cancelled orders.
+Cancelled orders are **not** physically removed from their deque (which would be O(Q)).
+Instead, the order is marked cancelled and the per-level volume counter is decremented in
+O(1).  The matching loop already skips cancelled entries, popping them in O(1) each.
 
-However:
+**Price levels** are eagerly cleaned when their tracked volume reaches zero — the entire
+level (deque, sorted\_prices entry, volume counter) is removed.  This ensures `best_price()`
+always returns a level with live volume, so `get_best_bid/ask` remain O(1).
 
-- Lazy deletion means `best_price()` may return a price level whose queue is entirely
-  cancelled — requiring a second scan to find the true best price.
-- This complicates `get_best_bid`, `get_best_ask`, `get_spread`, and `get_market_depth`.
-- In adversarial tests with many cancellations, stale price levels accumulate and slow all
-  queries.
-
-**Decision:** Eager cleanup on cancel and after each fill.
+This hybrid gives O(1) amortised cancel without the downsides of fully-lazy deletion (stale
+price levels polluting queries).  The `modify_order` path still uses eager O(Q) deque
+removal because the order must be physically moved to a new queue position.
 
 ### 4.3 Per-asset trade index vs. global tape
 

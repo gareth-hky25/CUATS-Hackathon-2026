@@ -23,7 +23,14 @@ DATA STRUCTURE CHOICES & JUSTIFICATION
        CPython and is substantially faster than ``list`` for left-side
        pops.
 
-3. Sorted price list  (``sorted_prices: list[float]``)
+3. Per-level volume tracker  (``_level_volume: dict[float, int]``)
+   ---------------------------------------------------------------
+   Each side tracks the *total resting quantity* at every active price
+   level.  Updated in O(1) on add, cancel, fill, and modify.  This
+   makes ``volume_at_price``, ``get_best_bid/ask``, ``get_spread``, and
+   ``get_market_depth`` all O(1) or O(levels) without iterating orders.
+
+4. Sorted price list  (``sorted_prices: list[float]``)
    ---------------------------------------------------
    A plain Python ``list`` kept sorted via ``bisect.insort``.
 
@@ -34,8 +41,8 @@ DATA STRUCTURE CHOICES & JUSTIFICATION
        where P is the number of *distinct active price levels* on that
        side.  In practice P is far smaller than the total number of
        orders, so the shift cost is negligible.
-   *   Removal of an exhausted price level  →  O(P) in the worst case
-       (list.remove), but again P is small.
+   *   Removal of an exhausted price level  →  O(log P) search via
+       ``bisect.bisect_left`` + O(P) worst-case shift.
 
    Alternatives considered and rejected:
 
@@ -56,34 +63,49 @@ DATA STRUCTURE CHOICES & JUSTIFICATION
    orders of magnitude smaller than the number of orders, this is an
    excellent practical trade-off.
 
-4. Order index  (``_orders_by_id: dict[int, Order]``)
+5. Lazy cancellation
+   -----------------
+   ``cancel_order`` does *not* scan the deque to physically remove the
+   cancelled order (which would be O(Q)).  Instead it marks the order as
+   cancelled and decrements the per-level volume counter in O(1).  The
+   matching loop already skips cancelled orders at the front of the
+   queue, popping them in O(1) each.  When a level's tracked volume
+   reaches zero the entire level is removed.  This makes cancel O(1)
+   amortised; stale entries are cleaned lazily during matching.
+
+6. Order index  (``_orders_by_id: dict[int, Order]``)
    --------------------------------------------------
    O(1) lookup for cancel / modify / status queries.
 
-5. Order history  (``_order_history: deque[Order]``)
+7. Order history  (``_order_history: deque[Order]``)
    ------------------------------------------------
-   Append-only, newest-first retrieval by slicing.
+   Append-only, newest-first retrieval by ``itertools.islice`` on
+   ``reversed()`` → O(n) for the requested *n*, not the full history.
 
-6. Trade history  (``_trades: list[Trade]``)
+8. Trade history  (``_trades: list[Trade]``)
    ----------------------------------------
    Append-only list; newest-first retrieval by reversed slicing.
 
 =============================================================================
-COMPLEXITY ANALYSIS  (P = price levels, K = fills, N = total orders)
+COMPLEXITY ANALYSIS  (P = price levels, Q = queue depth, K = fills,
+                      N = total orders, n = requested count)
 =============================================================================
 
-  submit_order   →  O(log P + K)   matching iterates over K fills;
-                                    resting-order insertion uses bisect.
-  cancel_order   →  O(1) amortised lookup + O(1) deque mark; price-level
-                     cleanup is deferred to matching (lazy).  Worst-case
-                     O(P) if we must remove the price from sorted_prices.
-  modify_order   →  O(log P)       cancel + re-insert.
-  get_best_bid   →  O(1)
-  get_best_ask   →  O(1)
-  get_spread     →  O(1)
-  get_market_depth → O(levels)
-  get_volume_at_price → O(Q) where Q is orders at that price (sum of
-                         remaining quantities in the deque).
+  submit_order        →  O(log P + K)   bisect insert + K fills each O(1).
+  cancel_order        →  O(1) amortised  mark + volume decrement.  Level
+                          cleanup (when volume hits 0) is O(log P + P).
+  modify_order        →  O(Q + log P)   eager deque removal + bisect
+                          re-insert.
+  get_best_bid/ask    →  O(1)           index into sorted_prices + volume
+                          lookup from _level_volume.
+  get_spread          →  O(1)           two best-price lookups.
+  get_market_depth    →  O(levels)      iterate prices, read _level_volume.
+  get_volume_at_price →  O(1)           dict lookup in _level_volume.
+  view_last_orders    →  O(n)           islice on reversed deque.
+  view_largest_orders →  O(N log n)     heapq.nlargest.
+  view_smallest_orders→  O(N log n)     heapq.nsmallest.
+  get_trade_history   →  O(T) or O(limit) reversed iteration.
+  get_order_status    →  O(F)           O(1) lookup + O(F) fill copy.
 
 =============================================================================
 """
@@ -91,6 +113,8 @@ COMPLEXITY ANALYSIS  (P = price levels, K = fills, N = total orders)
 from __future__ import annotations
 
 import bisect
+import heapq
+import itertools
 from collections import deque
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
@@ -107,22 +131,42 @@ class _SideBook:
     Maintains:
         price_map      : dict[float, deque[Order]]
         sorted_prices  : list[float]          — kept sorted ascending
+        _level_volume  : dict[float, int]     — aggregate resting qty per level
 
     For bids the best price is ``sorted_prices[-1]`` (highest).
     For asks the best price is ``sorted_prices[0]``  (lowest).
 
-    Complexity (P = number of distinct price levels):
-        add_order      : O(log P)   (bisect.insort)
-        remove_order   : O(P)       (worst case list.remove for price cleanup)
+    Complexity (P = number of distinct price levels, Q = queue depth):
+        add_order      : O(log P)   (bisect.insort + volume update)
+        remove_order   : O(Q)       (deque.remove for modify; eager)
+        cancel_order   : O(1) amort (lazy mark + volume decrement)
         best_price     : O(1)       (index into sorted list)
+        volume_at_price: O(1)       (dict lookup)
     """
 
-    __slots__ = ("price_map", "sorted_prices", "is_bid")
+    __slots__ = ("price_map", "sorted_prices", "is_bid", "_level_volume")
 
     def __init__(self, is_bid: bool) -> None:
         self.price_map: Dict[float, deque[Order]] = {}
         self.sorted_prices: List[float] = []
         self.is_bid = is_bid
+        self._level_volume: Dict[float, int] = {}
+
+    # ------------------------------------------------------------------ #
+    # Price-level lifecycle                                                #
+    # ------------------------------------------------------------------ #
+
+    def _remove_price_level(self, price: float) -> None:
+        """Remove all bookkeeping for *price*.  Idempotent.
+
+        Uses ``bisect.bisect_left`` for O(log P) index search, then
+        ``del sorted_prices[idx]`` for O(P) C-level shift.
+        """
+        self.price_map.pop(price, None)
+        self._level_volume.pop(price, None)
+        idx = bisect.bisect_left(self.sorted_prices, price)
+        if idx < len(self.sorted_prices) and self.sorted_prices[idx] == price:
+            del self.sorted_prices[idx]
 
     # ------------------------------------------------------------------ #
     # Mutations                                                            #
@@ -137,16 +181,18 @@ class _SideBook:
         if price not in self.price_map:
             self.price_map[price] = deque()
             bisect.insort(self.sorted_prices, price)
+            self._level_volume[price] = 0
         self.price_map[price].append(order)
+        self._level_volume[price] += order.remaining_quantity
 
     def remove_order(self, order: Order) -> None:
-        """Remove a specific *order* from its price level.
+        """Eagerly remove a specific *order* from its price level.
 
-        Used by cancel / modify.  After removal, if the price level is
-        empty the level is cleaned up.
+        Used by ``modify_order`` which needs the order physically removed
+        before re-inserting at a new price/position.
 
-        Complexity: O(Q) scan within the deque at this price (Q = queue
-        length) + O(P) for price-list removal in the worst case.
+        Complexity: O(Q) scan within the deque at this price + O(log P)
+        bisect search if the level is cleaned up.
         """
         price = order.price
         q = self.price_map.get(price)
@@ -156,15 +202,35 @@ class _SideBook:
             q.remove(order)
         except ValueError:
             return
-        if not q:
-            del self.price_map[price]
-            self.sorted_prices.remove(price)
+        self._level_volume[price] = self._level_volume.get(price, 0) - order.remaining_quantity
+        if self._level_volume.get(price, 0) <= 0:
+            self._remove_price_level(price)
+
+    def cancel_order(self, order: Order) -> None:
+        """Lazy-cancel: decrement volume without removing from the deque.
+
+        The cancelled order remains in the deque and is skipped (and
+        popped) lazily during matching.  When the level's tracked volume
+        reaches zero the entire level is removed.
+
+        Complexity: O(1) amortised.
+        """
+        price = order.price
+        vol = self._level_volume.get(price)
+        if vol is None:
+            return  # level already cleaned up
+        self._level_volume[price] = vol - order.remaining_quantity
+        if self._level_volume[price] <= 0:
+            self._remove_price_level(price)
+
+    def _update_fill(self, price: float, qty: int) -> None:
+        """Decrement level volume after a fill.  Called from ``_match``."""
+        self._level_volume[price] = self._level_volume.get(price, 0) - qty
 
     def _clean_level(self, price: float) -> None:
-        """Remove an empty price level after matching has drained it."""
-        if price in self.price_map and not self.price_map[price]:
-            del self.price_map[price]
-            self.sorted_prices.remove(price)
+        """Remove a price level if its tracked volume has been drained."""
+        if self._level_volume.get(price, 0) <= 0:
+            self._remove_price_level(price)
 
     # ------------------------------------------------------------------ #
     # Queries                                                              #
@@ -184,17 +250,14 @@ class _SideBook:
         return self.price_map.get(bp)
 
     def volume_at_price(self, price: float) -> int:
-        """Sum of remaining quantities at *price*.  O(Q)."""
-        q = self.price_map.get(price)
-        if q is None:
-            return 0
-        return sum(o.remaining_quantity for o in q)
+        """Total resting volume at *price*.  O(1)."""
+        return self._level_volume.get(price, 0)
 
     def depth(self, levels: int) -> List[Tuple[float, int]]:
         """Return up to *levels* ``(price, volume)`` pairs.
 
         Bids: descending price.  Asks: ascending price.
-        Complexity: O(levels × Q_avg).
+        Complexity: O(levels).
         """
         result: List[Tuple[float, int]] = []
         if self.is_bid:
@@ -204,7 +267,7 @@ class _SideBook:
         for p in prices:
             if len(result) >= levels:
                 break
-            vol = self.volume_at_price(p)
+            vol = self._level_volume.get(p, 0)
             if vol > 0:
                 result.append((p, vol))
         return result
@@ -288,8 +351,6 @@ class OrderBook:
         self,
         order: Order,
         book: _AssetBook,
-        *,
-        dry_run: bool = False,
     ) -> List[Trade]:
         """Core matching loop — price-time priority.
 
@@ -299,17 +360,16 @@ class OrderBook:
             The incoming (aggressor) order.
         book : _AssetBook
             The asset's order book.
-        dry_run : bool
-            If ``True``, simulate matching without mutating any state.
-            Used by FOK orders to check feasibility.
 
         Returns
         -------
         list[Trade]
-            The fills produced (empty list if ``dry_run``).
+            The fills produced.
 
-        Complexity: O(K) where K is the number of individual fills.  Each
-        fill is O(1) (deque popleft + dict / list appends).
+        Complexity: O(K + S) where K is the number of individual fills
+        and S is stale cancelled orders encountered and popped.  Each
+        fill and each stale pop is O(1).  S is amortised across all
+        cancel operations.
         """
 
         is_buy = order.side == "buy"
@@ -342,15 +402,6 @@ class OrderBook:
 
                 fill_qty = min(order.remaining_quantity, resting.remaining_quantity)
 
-                if dry_run:
-                    # Simulate without mutating
-                    order.remaining_quantity -= fill_qty
-                    resting.remaining_quantity -= fill_qty
-                    fills.append(None)  # placeholder
-                    if resting.remaining_quantity <= 0:
-                        queue.popleft()
-                    continue
-
                 # Execute the fill
                 if is_buy:
                     trade = Trade(
@@ -374,6 +425,9 @@ class OrderBook:
                 order.remaining_quantity -= fill_qty
                 resting.filled_quantity += fill_qty
                 resting.remaining_quantity -= fill_qty
+
+                # Update per-level volume tracker
+                contra_side._update_fill(best_p, fill_qty)
 
                 # Record trade on both orders
                 order.trades.append(trade)
@@ -556,12 +610,12 @@ class OrderBook:
     def cancel_order(self, order_id: int) -> bool:
         """Cancel a pending (or partially filled) order.
 
-        Removes the order from the resting book.  Fully filled or already-
-        cancelled orders cannot be cancelled.
+        Uses lazy deletion: the order is marked cancelled and the per-
+        level volume counter is decremented in O(1).  The order remains
+        in the deque and is popped lazily during matching.
 
-        Complexity: O(1) dict lookup + O(Q) deque removal + O(P) price
-        list removal in the worst case.  Amortised O(1) when price levels
-        are sparse.
+        Complexity: O(1) amortised.  Level cleanup (when volume hits 0)
+        adds O(log P + P) but happens at most once per level creation.
 
         Returns
         -------
@@ -575,10 +629,10 @@ class OrderBook:
         if order.remaining_quantity <= 0:
             return False
 
-        # Remove from book
+        # Lazy cancel: decrement volume, don't touch the deque
         book = self._get_book(order.asset)
         own_side = book.bids if order.side == "buy" else book.asks
-        own_side.remove_order(order)
+        own_side.cancel_order(order)
 
         order.status = "cancelled"
         return True
@@ -597,7 +651,8 @@ class OrderBook:
         *   Quantity increase → loses time priority (re-queued).
         *   New quantity must be > already-filled quantity.
 
-        Complexity: O(log P) — cancel + potential re-insert.
+        Complexity: O(Q + log P) — eager deque removal O(Q) + bisect
+        re-insert O(log P).  Quantity-decrease-only is O(1).
 
         Returns
         -------
@@ -633,15 +688,23 @@ class OrderBook:
             if new_price is not None:
                 order.price = new_price
             if new_quantity is not None:
+                old_remaining = order.remaining_quantity
                 order.quantity = new_quantity
                 order.remaining_quantity = new_quantity - order.filled_quantity
             order.timestamp = self._next_ts()
             own_side.add_order(order)
         else:
-            # Quantity decrease — keep position
+            # Quantity decrease — keep position, update volume delta
             if new_quantity is not None:
+                old_remaining = order.remaining_quantity
                 order.quantity = new_quantity
                 order.remaining_quantity = new_quantity - order.filled_quantity
+                delta = old_remaining - order.remaining_quantity
+                if delta != 0:
+                    price = order.price
+                    own_side._level_volume[price] = (
+                        own_side._level_volume.get(price, 0) - delta
+                    )
 
         return True
 
@@ -652,7 +715,7 @@ class OrderBook:
     def get_best_bid(self, asset: str) -> Optional[Tuple[float, int]]:
         """Best (highest) bid price and total volume.
 
-        Complexity: O(1) for price lookup + O(Q) to sum volume at that level.
+        Complexity: O(1).
 
         Returns
         -------
@@ -665,14 +728,14 @@ class OrderBook:
         if bp is None:
             return None
         vol = book.bids.volume_at_price(bp)
-        if vol == 0:
+        if vol <= 0:
             return None
         return (bp, vol)
 
     def get_best_ask(self, asset: str) -> Optional[Tuple[float, int]]:
         """Best (lowest) ask price and total volume.
 
-        Complexity: O(1) for price lookup + O(Q) to sum volume at that level.
+        Complexity: O(1).
 
         Returns
         -------
@@ -685,7 +748,7 @@ class OrderBook:
         if bp is None:
             return None
         vol = book.asks.volume_at_price(bp)
-        if vol == 0:
+        if vol <= 0:
             return None
         return (bp, vol)
 
@@ -723,7 +786,7 @@ class OrderBook:
     def get_volume_at_price(
         self, asset: str, price: float, side: Literal["bid", "ask"]
     ) -> int:
-        """Total resting volume at a specific price level.  O(Q).
+        """Total resting volume at a specific price level.  O(1).
 
         Returns
         -------
@@ -751,12 +814,18 @@ class OrderBook:
         for asset, book in self._books.items():
             bids_data = []
             for p in reversed(book.bids.sorted_prices):
-                orders = [o for o in book.bids.price_map[p] if o.remaining_quantity > 0]
+                orders = [
+                    o for o in book.bids.price_map[p]
+                    if o.status in ("pending", "partial") and o.remaining_quantity > 0
+                ]
                 if orders:
                     bids_data.append({"price": p, "orders": orders})
             asks_data = []
             for p in book.asks.sorted_prices:
-                orders = [o for o in book.asks.price_map[p] if o.remaining_quantity > 0]
+                orders = [
+                    o for o in book.asks.price_map[p]
+                    if o.status in ("pending", "partial") and o.remaining_quantity > 0
+                ]
                 if orders:
                     asks_data.append({"price": p, "orders": orders})
             snapshot[asset] = {"bids": bids_data, "asks": asks_data}
@@ -767,35 +836,31 @@ class OrderBook:
 
         Complexity: O(n).
         """
-        orders = list(self._order_history)
-        orders.reverse()
-        return orders[:n]
+        return list(itertools.islice(reversed(self._order_history), n))
 
     def view_largest_orders(self, n: int = 10000) -> List[Order]:
         """Return the *n* largest orders by original quantity (non-cancelled).
 
         Sorted by quantity descending.
 
-        Complexity: O(N log N) — full sort of non-cancelled orders.
+        Complexity: O(N log n) via ``heapq.nlargest``.
         """
         eligible = [
             o for o in self._order_history if o.status != "cancelled"
         ]
-        eligible.sort(key=lambda o: o.quantity, reverse=True)
-        return eligible[:n]
+        return heapq.nlargest(n, eligible, key=lambda o: o.quantity)
 
     def view_smallest_orders(self, n: int = 10000) -> List[Order]:
         """Return the *n* smallest orders by original quantity (non-cancelled).
 
         Sorted by quantity ascending.
 
-        Complexity: O(N log N).
+        Complexity: O(N log n) via ``heapq.nsmallest``.
         """
         eligible = [
             o for o in self._order_history if o.status != "cancelled"
         ]
-        eligible.sort(key=lambda o: o.quantity)
-        return eligible[:n]
+        return heapq.nsmallest(n, eligible, key=lambda o: o.quantity)
 
     # ------------------------------------------------------------------ #
     # Public API — Trade History & Status                                  #

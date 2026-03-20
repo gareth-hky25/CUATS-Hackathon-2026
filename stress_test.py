@@ -42,16 +42,24 @@ def reset_ids() -> None:
 def check_invariants(ob: OrderBook, label: str = "") -> None:
     """Assert that every internal invariant of the book holds.
 
+    Accounts for lazy-cancel semantics: deques may contain cancelled
+    orders (stale entries cleaned during matching).  The _level_volume
+    tracker must match the sum of live orders' remaining quantities.
+
     Raises AssertionError with a descriptive message on failure.
     """
     for asset, book in ob._books.items():
         for side_name, side in [("bids", book.bids), ("asks", book.asks)]:
             tag = f"[{label}] {asset}.{side_name}" if label else f"{asset}.{side_name}"
 
-            # sorted_prices and price_map must have the same keys
+            # sorted_prices, price_map, and _level_volume must have same keys
             assert set(side.sorted_prices) == set(side.price_map.keys()), (
                 f"{tag}: sorted_prices keys mismatch price_map keys. "
                 f"sorted={side.sorted_prices}, map_keys={list(side.price_map.keys())}"
+            )
+            assert set(side.sorted_prices) == set(side._level_volume.keys()), (
+                f"{tag}: sorted_prices keys mismatch _level_volume keys. "
+                f"sorted={side.sorted_prices}, vol_keys={list(side._level_volume.keys())}"
             )
 
             # sorted_prices must actually be sorted ascending
@@ -59,29 +67,45 @@ def check_invariants(ob: OrderBook, label: str = "") -> None:
                 f"{tag}: sorted_prices not sorted: {side.sorted_prices}"
             )
 
-            # No empty deques in price_map
-            for p, q in side.price_map.items():
-                assert len(q) > 0, f"{tag}: empty deque at price {p}"
-
-                # Every order in the queue should be resting (not filled/cancelled)
-                for o in q:
-                    assert o.status in ("pending", "partial"), (
-                        f"{tag}: order {o.order_id} in queue has status "
-                        f"{o.status!r}, expected pending/partial"
-                    )
-                    assert o.remaining_quantity > 0, (
-                        f"{tag}: order {o.order_id} has remaining_quantity=0 but "
-                        f"is still in the queue"
-                    )
-                    assert o.price == p, (
-                        f"{tag}: order {o.order_id} has price {o.price} but "
-                        f"is in bucket for price {p}"
-                    )
-
             # No duplicate prices in sorted_prices
             assert len(side.sorted_prices) == len(set(side.sorted_prices)), (
                 f"{tag}: duplicate prices in sorted_prices: {side.sorted_prices}"
             )
+
+            for p, q in side.price_map.items():
+                assert len(q) > 0, f"{tag}: empty deque at price {p}"
+
+                # _level_volume must be positive for every active level
+                tracked_vol = side._level_volume.get(p, 0)
+                assert tracked_vol > 0, (
+                    f"{tag}: _level_volume[{p}] = {tracked_vol}, expected > 0"
+                )
+
+                # Deque may contain cancelled orders (lazy cancel).
+                # Verify live orders have correct state and price.
+                live_vol = 0
+                for o in q:
+                    if o.status == "cancelled":
+                        continue  # stale entry — allowed by lazy cancel
+                    assert o.status in ("pending", "partial"), (
+                        f"{tag}: order {o.order_id} in queue has status "
+                        f"{o.status!r}, expected pending/partial/cancelled"
+                    )
+                    assert o.remaining_quantity > 0, (
+                        f"{tag}: live order {o.order_id} has "
+                        f"remaining_quantity=0"
+                    )
+                    assert o.price == p, (
+                        f"{tag}: order {o.order_id} has price {o.price} "
+                        f"but is in bucket for price {p}"
+                    )
+                    live_vol += o.remaining_quantity
+
+                # Volume tracker must match sum of live order quantities
+                assert live_vol == tracked_vol, (
+                    f"{tag}: _level_volume[{p}] = {tracked_vol} but "
+                    f"sum of live remaining = {live_vol}"
+                )
 
     # Every order: filled + remaining == quantity
     # Exception: market/IOC orders that partially fill have their remainder
