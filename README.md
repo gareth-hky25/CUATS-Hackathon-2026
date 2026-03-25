@@ -1,8 +1,8 @@
-# CUATS Hacakthon 2026
+# CUATS Hacakthon 2026 - Orderbook
 
-**1st Place** — CUATS Hackathon 2026, Cambridge University Algorithmic Trading Society
+**1st Place** — Cambridge University Algorithmic Trading Socitey (CUATS) Hackathon 2026
 
-A high-performance limit order book and matching engine built in 24 hours. Scored 100/100 — passing all 92 test cases across correctness, API robustness, multi-asset support, advanced order types, and performance stress tests (10k–50k order streams).
+A high-performance electronic trading exchange built for the CUATS Hackathon 2026 bulit in 24 hours. Implements a full limit order book with price-time priority matching, multiple order types, and efficient data structures designed for low-latency execution. Scored 100/100.
 
 ---
 
